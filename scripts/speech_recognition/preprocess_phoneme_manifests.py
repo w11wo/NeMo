@@ -1,8 +1,24 @@
 import json
 import os
 import re
-from collections import defaultdict
 from tqdm.auto import tqdm
+import argparse
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--train_manifest", type=str, required=True, help="Path to train manifest."
+)
+
+parser.add_argument(
+    "--test_manifest", type=str, default=None, help="Path to test manifest."
+)
+
+parser.add_argument(
+    "--valid_manifest", type=str, default=None, help="Path to valid manifest."
+)
+
+args = parser.parse_args()
 
 def read_manifest(path):
     manifest = []
@@ -48,20 +64,18 @@ PREPROCESSORS = [
     remove_special_characters,
 ]
 
-train_manifest = "train_decoded.json"
-dev_manifest = "dev_decoded.json"
-test_manifest = "test_decoded.json"
-
-train_data = read_manifest(train_manifest)
-dev_data = read_manifest(dev_manifest)
-test_data = read_manifest(test_manifest)
-
+train_data = read_manifest(args.train_manifest)
 # Apply preprocessing
 train_data_processed = apply_preprocessors(train_data, PREPROCESSORS)
-dev_data_processed = apply_preprocessors(dev_data, PREPROCESSORS)
-test_data_processed = apply_preprocessors(test_data, PREPROCESSORS)
-
 # Write new manifests
-train_manifest_cleaned = write_processed_manifest(train_data_processed, train_manifest)
-dev_manifest_cleaned = write_processed_manifest(dev_data_processed, dev_manifest)
-test_manifest_cleaned = write_processed_manifest(test_data_processed, test_manifest)
+train_manifest_cleaned = write_processed_manifest(train_data_processed, args.train_manifest)
+
+if args.valid_manifest is not None:
+    valid_data = read_manifest(args.valid_manifest)
+    valid_data_processed = apply_preprocessors(valid_data, PREPROCESSORS)
+    dev_manifest_cleaned = write_processed_manifest(valid_data_processed, args.valid_manifest)
+
+if args.test_manifest is not None:
+    test_data = read_manifest(args.test_manifest)
+    test_data_processed = apply_preprocessors(test_data, PREPROCESSORS)
+    test_manifest_cleaned = write_processed_manifest(test_data_processed, args.test_manifest)
