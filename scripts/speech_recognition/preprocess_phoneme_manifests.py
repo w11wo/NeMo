@@ -48,6 +48,7 @@ def remove_special_characters(data):
     chars_to_ignore_regex = "[\.\,\?\:\-!;“\"”″‟„�‘ˈˌ]"
     data["text"] = re.sub(chars_to_ignore_regex, " ", data["text"])  # replace punctuation by space
     data["text"] = re.sub(r" +", " ", data["text"])  # merge multiple spaces
+    data["text"] = data["text"].strip()
     return data
 
 # Processing pipeline
