@@ -318,6 +318,10 @@ def process_dataset(dataset: IterableDataset, cfg: HFDatasetConversionConfig):
     # for Common Voice, "sentence" is used instead of "text" to store the transcript.
     if 'sentence' in dataset.features:
         dataset = dataset.rename_column("sentence", "text")
+    elif 'phonemes' in dataset.features:
+        if 'text' in dataset.features:
+            dataset = dataset.remove_columns("text")
+        dataset = dataset.rename_column("phonemes", "text")
 
     if cfg.split_output_dir is None:
         basedir = cfg.resolved_output_dir
