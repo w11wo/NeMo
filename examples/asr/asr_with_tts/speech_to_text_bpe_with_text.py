@@ -19,8 +19,9 @@ Provide ASR model config, add options related to TTS and text-only data.
 ```shell
 python speech_to_text_bpe_with_text.py \
     # (Optional: --config-path=<path to dir of configs> --config-name=<name of config without .yaml>) \
-    ++asr_model_type=<rnnt_bpe or ctc_bpe> \
+    ++asr_model_type=<rnnt_bpe, ctc_bpe or hybrid_rnnt_ctc_bpe> \
     ++tts_model_path=<path to compatible tts model> \
+    ++enhancer_model_path=<optional path to enhancer model> \
     model.tokenizer.dir=<path to tokenizer> \
     model.tokenizer.type="bpe" \
     model.train_ds.manifest_filepath=<path(s) to manifest with audio-text pairs or null> \
@@ -48,13 +49,14 @@ python speech_to_text_bpe_with_text.py \
 """
 
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.models.hybrid_asr_tts_models import ASRWithTTSModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
+from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 
 @hydra_runner(config_path="examples/asr/conf/conformer", config_name="conformer_transducer_bpe")
@@ -66,11 +68,15 @@ def main(cfg):
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
     OmegaConf.resolve(cfg)
 
-    trainer = pl.Trainer(**cfg.trainer)
+    trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))
 
     asr_model = ASRWithTTSModel.from_asr_config(
-        asr_cfg=cfg.model, asr_model_type=cfg.asr_model_type, tts_model_path=cfg.tts_model_path, trainer=trainer
+        asr_cfg=cfg.model,
+        asr_model_type=cfg.asr_model_type,
+        tts_model_path=cfg.tts_model_path,
+        enhancer_model_path=cfg.get("enhancer_model_path", None),
+        trainer=trainer,
     )
 
     # Initialize the weights of the model from another model, if provided via config

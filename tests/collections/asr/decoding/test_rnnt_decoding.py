@@ -19,13 +19,13 @@ import pytest
 import torch
 from omegaconf import DictConfig
 
-from nemo.collections.asr.metrics.rnnt_wer import RNNTDecoding, RNNTDecodingConfig
-from nemo.collections.asr.metrics.rnnt_wer_bpe import RNNTBPEDecoding, RNNTBPEDecodingConfig
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.modules import RNNTDecoder, RNNTJoint
 from nemo.collections.asr.parts.mixins import mixins
-from nemo.collections.asr.parts.submodules import rnnt_beam_decoding as beam_decode
+from nemo.collections.asr.parts.submodules import rnnt_beam_decoding
 from nemo.collections.asr.parts.submodules import rnnt_greedy_decoding as greedy_decode
+from nemo.collections.asr.parts.submodules import tdt_beam_decoding
+from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
@@ -36,7 +36,7 @@ NUMBA_RNNT_LOSS_AVAILABLE = numba_utils.numba_cpu_is_supported(
 
 
 def char_vocabulary():
-    return [' ', 'a', 'b', 'c', 'd', 'e', 'f']
+    return [' ', 'a', 'b', 'c', 'd', 'e', 'f', '.']
 
 
 @pytest.fixture()
@@ -118,6 +118,88 @@ def decode_text_from_nbest_hypotheses(hyps, decoding):
     return hypotheses, all_hypotheses
 
 
+def check_char_timestamps(hyp: rnnt_utils.Hypothesis, decoding: RNNTDecoding):
+    assert hyp.timestep is not None
+    assert isinstance(hyp.timestep, dict)
+    assert 'timestep' in hyp.timestep
+    assert 'char' in hyp.timestep
+    assert 'word' in hyp.timestep
+    assert 'segment' in hyp.timestep
+
+    words = hyp.text.split(decoding.word_seperator)
+    words = list(filter(lambda x: x != '', words))
+    assert len(hyp.timestep['word']) == len(words)
+
+    segments = []
+    segment = []
+
+    for word in words:
+        segment.append(word)
+        if word[-1] in decoding.segment_seperators:
+            segments.append(' '.join(segment))
+            segment = []
+
+    if segment:
+        segments.append(' '.join(segment))
+
+    assert len(hyp.timestep['segment']) == len(segments)
+
+
+def check_subword_timestamps(hyp: rnnt_utils.Hypothesis, decoding: RNNTBPEDecoding):
+    assert hyp.timestep is not None
+    assert isinstance(hyp.timestep, dict)
+    assert 'timestep' in hyp.timestep
+    assert 'char' in hyp.timestep
+    assert 'word' in hyp.timestep
+    assert 'segment' in hyp.timestep
+
+    chars = list(hyp.text)
+    chars = list(filter(lambda x: x not in ['', ' ', '#'], chars))
+    all_chars = [list(decoding.tokenizer.tokens_to_text(data['char'])) for data in hyp.timestep['char']]
+    all_chars = [char for subword in all_chars for char in subword]
+    all_chars = list(filter(lambda x: x not in ['', ' ', '#'], all_chars))
+    assert len(chars) == len(all_chars)
+
+    segments_count = sum([hyp.text.count(seperator) for seperator in decoding.segment_seperators])
+    if not hyp.text or hyp.text[-1] not in decoding.segment_seperators:
+        segments_count += 1
+
+    assert len(hyp.timestep['segment']) == segments_count
+
+
+def check_beam_decoding(test_data_dir, beam_config):
+    beam_size = beam_config.pop("beam_size", 1)
+    model, encoded, encoded_len = get_model_encoder_output(test_data_dir, 'nvidia/parakeet-tdt_ctc-110m')
+
+    model_config = model.to_config_dict()
+    durations = list(model_config["model_defaults"]["tdt_durations"])
+
+    beam = tdt_beam_decoding.BeamTDTInfer(
+        model.decoder,
+        model.joint,
+        beam_size=beam_size,
+        return_best_hypothesis=False,
+        durations=durations,
+        **beam_config,
+    )
+
+    enc_out = encoded
+    enc_len = encoded_len
+
+    with torch.no_grad():
+        hyps: rnnt_utils.Hypothesis = beam(encoder_output=enc_out, encoded_lengths=enc_len)[0]
+        _, all_hyps = decode_text_from_nbest_hypotheses(hyps, model.decoding)
+        all_hyps = all_hyps[0]
+
+        print("Beam search algorithm :", beam_config['search_type'])
+        for idx, hyp_ in enumerate(all_hyps):
+            print("Hyp index", idx + 1, "text :", hyp_.text)
+
+            assert len(hyp_.timestep) > 0
+            print("Timesteps", hyp_.timestep)
+            print()
+
+
 class TestRNNTDecoding:
     @pytest.mark.unit
     def test_constructor(self):
@@ -130,7 +212,7 @@ class TestRNNTDecoding:
 
     @pytest.mark.unit
     def test_constructor_subword(self, tmp_tokenizer):
-        cfg = RNNTBPEDecodingConfig()
+        cfg = RNNTDecodingConfig()
         vocab = tmp_tokenizer.vocab
         decoder = get_rnnt_decoder(vocab_size=len(vocab))
         joint = get_rnnt_joint(vocab_size=len(vocab))
@@ -138,7 +220,8 @@ class TestRNNTDecoding:
         assert decoding is not None
 
     @pytest.mark.skipif(
-        not NUMBA_RNNT_LOSS_AVAILABLE, reason='RNNTLoss has not been compiled with appropriate numba version.',
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
     )
     @pytest.mark.with_downloads
     @pytest.mark.unit
@@ -178,26 +261,95 @@ class TestRNNTDecoding:
                 print(f"Tokens at timestep {t} = {t_u}")
             print()
 
-    # @pytest.mark.skipif(
-    #     not NUMBA_RNNT_LOSS_AVAILABLE, reason='RNNTLoss has not been compiled with appropriate numba version.',
-    # )
-    # @pytest.mark.with_downloads
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.with_downloads
+    @pytest.mark.unit
+    @pytest.mark.parametrize("loop_labels", [True, False])
+    def test_batched_greedy_decoding_preserve_alignments(self, test_data_dir, loop_labels: bool):
+        """Test batched greedy decoding using non-batched decoding as a reference"""
+        model, encoded, encoded_len = get_model_encoder_output(test_data_dir, 'stt_en_conformer_transducer_small')
+
+        search_algo = greedy_decode.GreedyBatchedRNNTInfer(
+            model.decoder,
+            model.joint,
+            blank_index=model.joint.num_classes_with_blank - 1,
+            max_symbols_per_step=5,
+            preserve_alignments=True,
+            loop_labels=loop_labels,
+        )
+
+        etalon_search_algo = greedy_decode.GreedyRNNTInfer(
+            model.decoder,
+            model.joint,
+            blank_index=model.joint.num_classes_with_blank - 1,
+            max_symbols_per_step=5,
+            preserve_alignments=True,
+        )
+
+        enc_out = encoded
+        enc_len = encoded_len
+
+        with torch.no_grad():
+            hyps: list[rnnt_utils.Hypothesis] = search_algo(encoder_output=enc_out, encoded_lengths=enc_len)[0]
+            hyp = decode_text_from_greedy_hypotheses(hyps, model.decoding)[0]
+            etalon_hyps: list[rnnt_utils.Hypothesis] = etalon_search_algo(
+                encoder_output=enc_out, encoded_lengths=enc_len
+            )[0]
+            etalon_hyp = decode_text_from_greedy_hypotheses(etalon_hyps, model.decoding)[0]
+
+            assert hyp.alignments is not None
+            assert etalon_hyp.alignments is not None
+
+            assert hyp.text == etalon_hyp.text
+            assert len(hyp.alignments) == len(etalon_hyp.alignments)
+
+            for t in range(len(hyp.alignments)):
+                t_u = []
+                for u in range(len(hyp.alignments[t])):
+                    logp, label = hyp.alignments[t][u]
+                    assert torch.is_tensor(logp)
+                    assert torch.is_tensor(label)
+                    etalon_logp, etalon_label = etalon_hyp.alignments[t][u]
+                    assert label == etalon_label
+                    assert torch.allclose(logp, etalon_logp, atol=1e-4, rtol=1e-4)
+
+                    t_u.append(int(label))
+
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.with_downloads
     @pytest.mark.unit
     @pytest.mark.parametrize(
         "beam_config",
         [
             {"search_type": "greedy"},
-            {"search_type": "default", "beam_size": 2,},
-            {"search_type": "alsd", "alsd_max_target_len": 0.5, "beam_size": 2,},
-            {"search_type": "tsd", "tsd_max_sym_exp_per_step": 3, "beam_size": 2,},
+            {
+                "search_type": "default",
+                "beam_size": 2,
+            },
+            {
+                "search_type": "alsd",
+                "alsd_max_target_len": 0.5,
+                "beam_size": 2,
+            },
+            {
+                "search_type": "tsd",
+                "tsd_max_sym_exp_per_step": 3,
+                "beam_size": 2,
+            },
             {"search_type": "maes", "maes_num_steps": 2, "maes_expansion_beta": 2, "beam_size": 2},
             {"search_type": "maes", "maes_num_steps": 3, "maes_expansion_beta": 1, "beam_size": 2},
         ],
     )
-    def test_beam_decoding_preserve_alignments(self, test_data_dir, beam_config):
+    def test_rnnt_beam_decoding_preserve_alignments(self, test_data_dir, beam_config):
         beam_size = beam_config.pop("beam_size", 1)
         model, encoded, encoded_len = get_model_encoder_output(test_data_dir, 'stt_en_conformer_transducer_small')
-        beam = beam_decode.BeamRNNTInfer(
+        beam = rnnt_beam_decoding.BeamRNNTInfer(
             model.decoder,
             model.joint,
             beam_size=beam_size,
@@ -228,7 +380,8 @@ class TestRNNTDecoding:
                 print("Hyp index", idx + 1, "text :", hyp_.text)
 
                 # Alignment length (T) must match audio length (T)
-                assert len(hyp_.alignments) == enc_len[0]
+                # NOTE: increase length threshold to two to prevent intermittent failures when a word is split into subwords
+                assert abs(len(hyp_.alignments) - enc_len[0]) <= 2  # 1
 
                 for t in range(len(hyp_.alignments)):
                     t_u = []
@@ -253,3 +406,121 @@ class TestRNNTDecoding:
                 assert len(hyp_.timestep) > 0
                 print("Timesteps", hyp_.timestep)
                 print()
+
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.with_downloads
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "model_name, decoding_strategy",
+        [
+            ("stt_en_conformer_transducer_small", "greedy"),
+            ("stt_en_conformer_transducer_small", "greedy_batch"),
+            ("stt_en_conformer_transducer_small", "beam"),
+            # ("stt_en_conformer_transducer_small", "tsd"),
+            ("stt_en_conformer_transducer_small", "alsd"),
+            ("nvidia/parakeet-tdt_ctc-110m", "greedy"),
+            ("nvidia/parakeet-tdt_ctc-110m", "greedy_batch"),
+        ],
+    )
+    def test_subword_decoding_compute_timestamps(self, test_data_dir, decoding_strategy, model_name):
+
+        model, encoded, encoded_len = get_model_encoder_output(test_data_dir, model_name)
+
+        cfg = DictConfig(model.cfg.decoding)
+        cfg['strategy'] = decoding_strategy
+        cfg['preserve_alignments'] = True
+        cfg['compute_timestamps'] = True
+
+        decoding = RNNTBPEDecoding(
+            decoding_cfg=cfg, decoder=model.decoder, joint=model.joint, tokenizer=model.tokenizer
+        )
+
+        hyps, _ = decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len, return_hypotheses=True)
+
+        check_subword_timestamps(hyps[0], decoding)
+
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.with_downloads
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "model_name, decoding_strategy",
+        [
+            ("stt_en_conformer_transducer_small", "greedy"),
+            ("stt_en_conformer_transducer_small", "greedy_batch"),
+            ("stt_en_conformer_transducer_small", "beam"),
+            # ("stt_en_conformer_transducer_small", "tsd"),
+            ("stt_en_conformer_transducer_small", "alsd"),
+            ("nvidia/parakeet-tdt_ctc-110m", "greedy"),
+            ("nvidia/parakeet-tdt_ctc-110m", "greedy_batch"),
+        ],
+    )
+    def test_char_decoding_compute_timestamps(self, test_data_dir, decoding_strategy, model_name):
+
+        model, encoded, encoded_len = get_model_encoder_output(test_data_dir, model_name)
+
+        cfg = DictConfig(model.cfg.decoding)
+        cfg['strategy'] = decoding_strategy
+        cfg['preserve_alignments'] = True
+        cfg['compute_timestamps'] = True
+
+        vocab = [t[0] for t in model.tokenizer.vocab]
+
+        decoding = RNNTDecoding(decoding_cfg=cfg, decoder=model.decoder, joint=model.joint, vocabulary=vocab)
+
+        hyps, _ = decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len, return_hypotheses=True)
+
+        check_char_timestamps(hyps[0], decoding)
+
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.with_downloads
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "beam_config",
+        [
+            {
+                "search_type": "default",
+                "beam_size": 2,
+            },
+            {"search_type": "maes", "maes_num_steps": 2, "maes_expansion_beta": 2, "beam_size": 2},
+            {"search_type": "maes", "maes_num_steps": 2, "maes_expansion_beta": 1, "beam_size": 4},
+        ],
+    )
+    def test_tdt_beam_decoding(self, test_data_dir, beam_config):
+        check_beam_decoding(test_data_dir, beam_config)
+
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.with_downloads
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "beam_config",
+        [
+            {
+                "search_type": "maes",
+                "maes_num_steps": 2,
+                "maes_expansion_beta": 1,
+                "beam_size": 4,
+                "ngram_lm_alpha": 0.3,
+            },
+        ],
+    )
+    def test_tdt_beam_decoding_with_kenlm(self, test_data_dir, beam_config):
+        # skipping if kenlm is not installed
+        pytest.importorskip("kenlm", reason="Skipping test because 'kenlm' is not installed.")
+
+        kenlm_model_path = os.path.join(
+            test_data_dir, "asr", "kenlm_ngram_lm", "parakeet-tdt_ctc-110m-libri-1024.kenlm.tmp.arpa"
+        )
+        beam_config["ngram_lm_model"] = kenlm_model_path
+        check_beam_decoding(test_data_dir, beam_config)

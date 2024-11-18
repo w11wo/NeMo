@@ -21,10 +21,15 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.metrics.wer import WER, CTCDecoding, CTCDecodingConfig
-from nemo.collections.asr.metrics.wer_bpe import WERBPE, CTCBPEDecoding, CTCBPEDecodingConfig
+from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models import EncDecCTCModel, EncDecCTCModelBPE
-from nemo.collections.asr.parts.utils.audio_utils import get_samples
+from nemo.collections.asr.parts.preprocessing.segment import get_samples
+from nemo.collections.asr.parts.submodules.ctc_decoding import (
+    CTCBPEDecoding,
+    CTCBPEDecodingConfig,
+    CTCDecoding,
+    CTCDecodingConfig,
+)
 from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map, get_uniqname_from_filepath
 from nemo.collections.asr.parts.utils.streaming_utils import AudioFeatureIterator, FrameBatchASR
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
@@ -44,7 +49,7 @@ def if_none_get_default(param, default_value):
     return (param, default_value)[param is None]
 
 
-class WERBPE_TS(WERBPE):
+class WERBPE_TS(WER):
     """
     This is WERBPE_TS class that is modified for generating word_timestamps with logits.
     The functions in WER class is modified to save the word_timestamps whenever BPE token
@@ -192,7 +197,9 @@ class WER_TS(WER):
         return token_list, timestamp_list
 
     def ctc_decoder_predictions_tensor_with_ts(
-        self, predictions: torch.Tensor, predictions_len: torch.Tensor = None,
+        self,
+        predictions: torch.Tensor,
+        predictions_len: torch.Tensor = None,
     ) -> List[str]:
         """
         A shortened version of the original function ctc_decoder_predictions_tensor().
@@ -232,7 +239,7 @@ def get_wer_feat_logit(audio_file_path, asr, frame_len, tokens_per_chunk, delay,
     return hyp, tokens, log_prob
 
 
-class FrameBatchASR_Logits(FrameBatchASR):
+class FrameBatchASRLogits(FrameBatchASR):
     """
     A class for streaming frame-based ASR.
     Inherits from FrameBatchASR and adds new capability of returning the logit output.
@@ -260,10 +267,9 @@ class FrameBatchASR_Logits(FrameBatchASR):
         self.set_frame_reader(frame_reader)
 
     @torch.no_grad()
-    def _get_batch_preds(self):
+    def _get_batch_preds(self, keep_logits):
         device = self.asr_model.device
         for batch in iter(self.data_loader):
-
             feat_signal, feat_signal_len = batch
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
             log_probs, encoded_len, predictions = self.asr_model(
@@ -272,14 +278,19 @@ class FrameBatchASR_Logits(FrameBatchASR):
             preds = torch.unbind(predictions)
             for pred in preds:
                 self.all_preds.append(pred.cpu().numpy())
+            # Always keep logits in FrameBatchASRLogits
+            _ = keep_logits
             log_probs_tup = torch.unbind(log_probs)
             for log_prob in log_probs_tup:
                 self.all_logprobs.append(log_prob)
+            del log_probs, log_probs_tup
             del encoded_len
             del predictions
 
     def transcribe_with_ts(
-        self, tokens_per_chunk: int, delay: int,
+        self,
+        tokens_per_chunk: int,
+        delay: int,
     ):
         self.infer_logits()
         self.unmerged = []
@@ -340,6 +351,17 @@ class ASRDecoderTimeStamps:
             self.word_ts_anchor_offset = if_none_get_default(self.params['word_ts_anchor_offset'], 0.12)
             self.asr_batch_size = if_none_get_default(self.params['asr_batch_size'], 4)
             self.model_stride_in_secs = 0.02
+
+        elif 'fastconformer' in self.ASR_model_name.lower():
+            self.run_ASR = self.run_ASR_BPE_CTC
+            self.encdec_class = EncDecCTCModelBPE
+            self.decoder_delay_in_sec = if_none_get_default(self.params['decoder_delay_in_sec'], 0.08)
+            self.word_ts_anchor_offset = if_none_get_default(self.params['word_ts_anchor_offset'], 0.12)
+            self.asr_batch_size = if_none_get_default(self.params['asr_batch_size'], 16)
+            self.model_stride_in_secs = 0.08
+            # FastConformer requires buffered inference and the parameters for buffered processing.
+            self.chunk_len_in_sec = 15
+            self.total_buffer_in_secs = 30
 
         elif 'conformer' in self.ASR_model_name.lower():
             self.run_ASR = self.run_ASR_BPE_CTC
@@ -427,11 +449,13 @@ class ASRDecoderTimeStamps:
             log_prediction=asr_model._cfg.get("log_prediction", False),
         )
 
-        with torch.cuda.amp.autocast():
-            transcript_logits_list = asr_model.transcribe(
-                self.audio_file_list, batch_size=self.asr_batch_size, logprobs=True
-            )
+        with torch.amp.autocast(asr_model.device.type):
+            transcript_hyps_list = asr_model.transcribe(
+                self.audio_file_list, batch_size=self.asr_batch_size, return_hypotheses=True
+            )  # type: List[nemo_asr.parts.Hypothesis]
+            transcript_logits_list = [hyp.alignments for hyp in transcript_hyps_list]
             for idx, logit_np in enumerate(transcript_logits_list):
+                logit_np = logit_np.cpu().numpy()
                 uniq_id = get_uniqname_from_filepath(self.audio_file_list[idx])
                 if self.beam_search_decoder:
                     logging.info(
@@ -553,11 +577,13 @@ class ASRDecoderTimeStamps:
             log_prediction=asr_model._cfg.get("log_prediction", False),
         )
 
-        with torch.cuda.amp.autocast():
-            transcript_logits_list = asr_model.transcribe(
-                self.audio_file_list, batch_size=self.asr_batch_size, logprobs=True
-            )
+        with torch.amp.autocast(asr_model.device.type):
+            transcript_hyps_list = asr_model.transcribe(
+                self.audio_file_list, batch_size=self.asr_batch_size, return_hypotheses=True
+            )  # type: List[nemo_asr.parts.Hypothesis]
+            transcript_logits_list = [hyp.alignments for hyp in transcript_hyps_list]
             for idx, logit_np in enumerate(transcript_logits_list):
+                log_prob = logit_np.cpu().numpy()
                 uniq_id = get_uniqname_from_filepath(self.audio_file_list[idx])
                 if self.beam_search_decoder:
                     logging.info(
@@ -635,7 +661,7 @@ class ASRDecoderTimeStamps:
             log_prediction=asr_model._cfg.get("log_prediction", False),
         )
 
-        frame_asr = FrameBatchASR_Logits(
+        frame_asr = FrameBatchASRLogits(
             asr_model=asr_model,
             frame_len=self.chunk_len_in_sec,
             total_buffer=self.total_buffer_in_secs,
@@ -645,7 +671,7 @@ class ASRDecoderTimeStamps:
         onset_delay, mid_delay, tokens_per_chunk = self.set_buffered_infer_params(asr_model)
         onset_delay_in_sec = round(onset_delay * self.model_stride_in_secs, 2)
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(asr_model.device.type):
             logging.info(f"Running ASR model {self.ASR_model_name}")
 
             for idx, audio_file_path in enumerate(self.audio_file_list):
@@ -709,7 +735,10 @@ class ASRDecoderTimeStamps:
         elif len(spaces_in_sec) > 0:
             # word_timetamps_middle should be an empty list if len(spaces_in_sec) == 1.
             word_timetamps_middle = [
-                [round(spaces_in_sec[k][1], 2), round(spaces_in_sec[k + 1][0], 2),]
+                [
+                    round(spaces_in_sec[k][1], 2),
+                    round(spaces_in_sec[k + 1][0], 2),
+                ]
                 for k in range(len(spaces_in_sec) - 1)
             ]
             word_timestamps = (

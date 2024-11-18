@@ -19,9 +19,10 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+from lightning.pytorch.loops.fetchers import _DataFetcherWrapper
+from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf.dictconfig import DictConfig
 from omegaconf.listconfig import ListConfig
-from pytorch_lightning.trainer.trainer import Trainer
 from sacrebleu import corpus_bleu
 
 from nemo.collections.nlp.data.common.sequence_to_sequence_dataset import (
@@ -45,18 +46,34 @@ from nemo.collections.nlp.models.language_modeling.megatron_lm_encoder_decoder_m
 from nemo.collections.nlp.models.language_modeling.megatron_t5_model import MegatronT5Model
 from nemo.collections.nlp.models.machine_translation.mt_enc_dec_model import MTEncDecModel
 from nemo.collections.nlp.modules.common.megatron.megatron_export import DecEmb, EncEmb, TokensHeadEmb
+from nemo.collections.nlp.modules.common.megatron.utils import get_iterator_k_split
 from nemo.collections.nlp.parts.nlp_overrides import GlobalBatchDataFetcher
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.core.classes import Exportable
 from nemo.utils import AppState, logging, timers
 
 try:
-    from apex.transformer import parallel_state
-    from apex.transformer.pipeline_parallel.utils import _reconfigure_microbatch_calculator
+    from megatron.core import parallel_state
 
-    HAVE_APEX = True
+    HAVE_MEGATRON_CORE = True
+
 except (ImportError, ModuleNotFoundError):
-    HAVE_APEX = False
+
+    HAVE_MEGATRON_CORE = False
+
+try:
+    from megatron.core.num_microbatches_calculator import (
+        get_micro_batch_size,
+        get_num_microbatches,
+        reconfigure_num_microbatches_calculator,
+    )
+
+except (ImportError, ModuleNotFoundError):
+    logging.warning("Megatron num_microbatches_calculator not found, using Apex version.")
+    from apex.transformer.pipeline_parallel.utils import (
+        _reconfigure_microbatch_calculator as reconfigure_num_microbatches_calculator,
+    )
+    from apex.transformer.pipeline_parallel.utils import get_micro_batch_size, get_num_microbatches
 
 
 __all__ = ["MegatronNMTModel"]
@@ -75,8 +92,8 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer):
         # All of the lines below need to be set when the parent class calls self._build_tokenizer()
-        self.encoder_tokenizer_library = cfg.encoder_tokenizer.get('library', 'yttm')
-        self.decoder_tokenizer_library = cfg.decoder_tokenizer.get('library', 'yttm')
+        self.encoder_tokenizer_library = cfg.encoder_tokenizer.get('library', 'sentencepiece')
+        self.decoder_tokenizer_library = cfg.decoder_tokenizer.get('library', 'sentencepiece')
         self.multilingual_lang_tokens = {}
         self.src_language = cfg.get("src_language", None)
         self.tgt_language = cfg.get("tgt_language", None)
@@ -135,7 +152,7 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
     def setup(self, stage=None):
         # NOTE: super().__init__ will try and setup train/val/test datasets, but we sidestep this using a if self._train_ds is not None condition
         # We then set things up for real only once setup() of this class is called.
-        resume_checkpoint_path = self.trainer._checkpoint_connector.resume_from_checkpoint_fit_path
+        resume_checkpoint_path = self.trainer.ckpt_path
         if resume_checkpoint_path:
             init_consumed_samples = self._extract_consumed_samples_from_ckpt(resume_checkpoint_path)
         else:
@@ -193,17 +210,21 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
         self.encoder_tokenizer, self.decoder_tokenizer = MTEncDecModel.setup_enc_dec_tokenizers(
             encoder_tokenizer_library=self.encoder_tokenizer_library,
             encoder_tokenizer_model=encoder_tokenizer_model,
-            encoder_bpe_dropout=self._cfg.encoder_tokenizer.get('bpe_dropout', 0.0)
-            if self._cfg.encoder_tokenizer.get('bpe_dropout', 0.0) is not None
-            else 0.0,
+            encoder_bpe_dropout=(
+                self._cfg.encoder_tokenizer.get('bpe_dropout', 0.0)
+                if self._cfg.encoder_tokenizer.get('bpe_dropout', 0.0) is not None
+                else 0.0
+            ),
             encoder_model_name=self._cfg.encoder_tokenizer.get('type', None),
             encoder_r2l=self._cfg.encoder_tokenizer.get('r2l', False),
             decoder_tokenizer_library=self.decoder_tokenizer_library,
             encoder_tokenizer_vocab_file=self._cfg.encoder_tokenizer.get('vocab_file', None),
             decoder_tokenizer_model=decoder_tokenizer_model,
-            decoder_bpe_dropout=self._cfg.decoder_tokenizer.get('bpe_dropout', 0.0)
-            if self._cfg.decoder_tokenizer.get('bpe_dropout', 0.0) is not None
-            else 0.0,
+            decoder_bpe_dropout=(
+                self._cfg.decoder_tokenizer.get('bpe_dropout', 0.0)
+                if self._cfg.decoder_tokenizer.get('bpe_dropout', 0.0) is not None
+                else 0.0
+            ),
             decoder_model_name=self._cfg.encoder_tokenizer.get('type', None),
             decoder_r2l=self._cfg.decoder_tokenizer.get('r2l', False),
             encoder_sentencepiece_legacy=self._cfg.encoder_tokenizer.get('sentencepiece_legacy', False),
@@ -235,10 +256,14 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
                     f"NMT-XLM objective requires sentencepiece tokenizer, but got decoder tokenizer library : {self.cfg.decoder_tokenizer.library}"
                 )
             MegatronT5Model.add_special_tokens_to_tokenizer(
-                tokenizer=self.encoder_tokenizer, tokenizer_cfg=self.cfg.encoder_tokenizer, dataset_type='ul2',
+                tokenizer=self.encoder_tokenizer,
+                tokenizer_cfg=self.cfg.encoder_tokenizer,
+                dataset_type='ul2',
             )
             MegatronT5Model.add_special_tokens_to_tokenizer(
-                tokenizer=self.decoder_tokenizer, tokenizer_cfg=self.cfg.decoder_tokenizer, dataset_type='ul2',
+                tokenizer=self.decoder_tokenizer,
+                tokenizer_cfg=self.cfg.decoder_tokenizer,
+                dataset_type='ul2',
             )
 
         # Set up pre and post processors as well.
@@ -260,7 +285,10 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
         else:
             # After this call, the model will have  self.source_processor and self.target_processor objects
             self.source_processor, self.target_processor = MTEncDecModel.setup_pre_and_post_processing_utils(
-                self.src_language, self.tgt_language, self.encoder_tokenizer_library, self.decoder_tokenizer_library,
+                self.src_language,
+                self.tgt_language,
+                self.encoder_tokenizer_library,
+                self.decoder_tokenizer_library,
             )
             self.multilingual_ids = [None]
 
@@ -270,14 +298,42 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
             tensor_model_parallel_size=self._cfg.get('tensor_model_parallel_size', 1),
         )
 
-    def eval_step(self, batch, batch_idx, dataloader_idx=0):
+    def fwd_bwd_step(self, dataloader_iter, forward_only):
+        """
+        Dataloader produces a global batch which is turned into a list of microbatches.
+        The list of microbatches is then piped through the pipeline using Apex fwd/bwd functions.
+        """
+        # If tuple, 1st element in it is the batch since dataloader_iter returns batch, batch_idx, dataloader_idx
+        batch = next(dataloader_iter)
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        if isinstance(batch, dict):
+            # convert to list if not already converted.
+            batch = self._process_batch(batch)
+
+        # Get seq length of batch
+        encoder_seq_length = batch[0].size(1)
+        decoder_seq_length = batch[1].size(1)
+
+        tensor_shape = [encoder_seq_length, get_micro_batch_size(), self.cfg.encoder.hidden_size]
+        data_iter = get_iterator_k_split(batch, get_num_microbatches())
+
+        return self._execute_fwd_bwd_function(
+            data_iterator=data_iter,
+            forward_only=forward_only,
+            tensor_shape=tensor_shape,
+            decoder_seq_length=decoder_seq_length,
+        )
+
+    def eval_step(self, dataloader_iter):
         # Need to squeze dim 0 for old NMT datasets since things are pre-batched and we ask the dataloader for batch size 1.
+        batch, _, dataloader_idx = next(dataloader_iter)
         batch = [x.squeeze(dim=0) if x.ndim == 3 else x for x in batch]
         batch = self.process_global_batch_for_text_translation_datasets(batch)
 
         # Eval step requires text datasets so we need to reconfigure MBS on each batch.
         app_state = AppState()
-        _reconfigure_microbatch_calculator(
+        reconfigure_num_microbatches_calculator(
             rank=app_state.global_rank,
             rampup_batch_size=None,
             global_batch_size=batch['text_enc'].size(0) * parallel_state.get_data_parallel_world_size(),
@@ -285,7 +341,8 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
             data_parallel_size=parallel_state.get_data_parallel_world_size(),
         )
         # This returns the averaged loss across data-parallel groups.
-        reduced_loss = super().validation_step(batch, batch_idx, dataloader_idx)
+        reduced_loss = self.fwd_bwd_step(itertools.chain([batch]), True)
+
         tokens_enc, labels, enc_mask = batch['text_enc'], batch['labels'], batch['enc_mask']
 
         predicted_tokens_ids, _ = self.decode(
@@ -305,21 +362,37 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
 
         # Post-process the translations and inputs to log.
         preds = self.postprocess_outputs(
-            outputs=predicted_tokens_ids, tokenizer=self.decoder_tokenizer, processor=target_processor,
+            outputs=predicted_tokens_ids,
+            tokenizer=self.decoder_tokenizer,
+            processor=target_processor,
         )
         labels = self.postprocess_outputs(
-            outputs=labels, tokenizer=self.decoder_tokenizer, processor=target_processor,
+            outputs=labels,
+            tokenizer=self.decoder_tokenizer,
+            processor=target_processor,
         )
         encoder_inputs = self.postprocess_outputs(
-            outputs=tokens_enc, tokenizer=self.encoder_tokenizer, processor=source_processor,
+            outputs=tokens_enc,
+            tokenizer=self.encoder_tokenizer,
+            processor=source_processor,
         )
 
-        return {
+        loss_dict = {
             'inputs': encoder_inputs,
             'translations': preds,
             'ground_truths': labels,
-            'loss': reduced_loss,
         }
+        if isinstance(reduced_loss, dict):
+            loss_dict.update(reduced_loss)
+        else:
+            loss_dict['loss'] = reduced_loss
+
+        if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
+            self.validation_step_outputs[dataloader_idx].append(loss_dict)
+        else:
+            self.validation_step_outputs.append(loss_dict)
+
+        return loss_dict
 
     def postprocess_outputs(self, outputs, tokenizer, processor):
         # Convert ids to lists.
@@ -344,12 +417,12 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
 
         return results
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+    def validation_step(self, dataloader_iter):
         """
         Lightning calls this inside the validation loop with the data from the validation dataloader
         passed in as `batch`.
         """
-        return self.eval_step(batch, batch_idx, dataloader_idx)
+        return self.eval_step(dataloader_iter)
 
     def _setup_eval_dataloader_from_config(self, cfg: DictConfig, dataset):
         rank = parallel_state.get_data_parallel_rank()
@@ -368,16 +441,17 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
                     pin_memory=cfg.get("pin_memory", False),
                     drop_last=cfg.get("drop_last", False),
                     shuffle=False,
+                    persistent_workers=True if cfg.get("num_workers", 0) > 0 else False,
                 )
             )
 
         return dataloaders
 
-    def validation_epoch_end(self, outputs):
-        return self.eval_epoch_end(outputs, 'val')
+    def on_validation_epoch_end(self):
+        return self.eval_epoch_end(self.validation_step_outputs, 'val')
 
-    def test_epoch_end(self, outputs):
-        return self.eval_epoch_end(outputs, 'test')
+    def on_test_epoch_end(self):
+        return self.eval_epoch_end(self.test_step_outputs, 'test')
 
     def eval_epoch_end(self, outputs, mode):
         if not outputs:
@@ -464,18 +538,29 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
                 if self.multilingual:
                     self._log_multilingual_bleu_and_loss(dataloader_idx, bleu_score, averaged_loss, mode)
                 else:
-                    self.log(f'{mode}_sacreBLEU', bleu_score)
-                    self.log(f'{mode}_loss', averaged_loss, prog_bar=True)
+                    self.log(f'{mode}_sacreBLEU', bleu_score, batch_size=1)
+                    self.log(f'{mode}_loss', averaged_loss, prog_bar=True, batch_size=1)
             else:
                 if self.multilingual:
                     self._log_multilingual_bleu_and_loss(dataloader_idx, bleu_score, averaged_loss, mode)
                 else:
-                    self.log(f'{mode}_sacreBLEU_dl_index_{dataloader_idx}', bleu_score)
-                    self.log(f'{mode}_loss_dl_index_{dataloader_idx}', averaged_loss, prog_bar=False)
+                    self.log(f'{mode}_sacreBLEU_dl_index_{dataloader_idx}', bleu_score, batch_size=1)
+                    self.log(f'{mode}_loss_dl_index_{dataloader_idx}', averaged_loss, prog_bar=False, batch_size=1)
+            outputs[dataloader_idx].clear()  # free memory
 
         if len(loss_list) > 1:
-            self.log(f"{mode}_loss_avg", np.mean(loss_list), sync_dist=True)
-            self.log(f"{mode}_sacreBLEU_avg", np.mean(bleu_score_list))
+            self.log(f"{mode}_loss_avg", np.mean(loss_list), sync_dist=True, batch_size=1)
+            self.log(f"{mode}_sacreBLEU_avg", np.mean(bleu_score_list), batch_size=1)
+
+        app_state = AppState()
+        if hasattr(self, "_train_ds"):
+            reconfigure_num_microbatches_calculator(
+                rank=app_state.global_rank,
+                rampup_batch_size=None,
+                global_batch_size=self._cfg.train_ds.global_batch_size,
+                micro_batch_size=self._cfg.train_ds.micro_batch_size,
+                data_parallel_size=parallel_state.get_data_parallel_world_size(),
+            )
 
     def _log_multilingual_bleu_and_loss(self, dataloader_idx, bleu_score, loss, mode):
         """
@@ -487,8 +572,8 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
         else:
             translation_lang_string = f'{self.src_language}-{self.tgt_language[dataloader_idx]}'
 
-        self.log(f'{mode}_sacreBLEU_{translation_lang_string}', bleu_score, sync_dist=True)
-        self.log(f'{mode}_loss_{translation_lang_string}', loss, sync_dist=True)
+        self.log(f'{mode}_sacreBLEU_{translation_lang_string}', bleu_score, sync_dist=True, batch_size=1)
+        self.log(f'{mode}_loss_{translation_lang_string}', loss, sync_dist=True, batch_size=1)
 
     def setup_validation_data(self, val_data_config: Optional[DictConfig]):
         if hasattr(self, '_validation_ds'):
@@ -529,6 +614,7 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
             collate_fn=collate_fn,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
+            persistent_workers=True if cfg.num_workers > 0 else False,
         )
 
     def process_global_batch_for_text_translation_datasets(self, batch):
@@ -712,12 +798,12 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
                     tgt_file=tgt_file,
                     num_samples=num_samples,
                     prepend_id=multilingual_ids[idx],
-                    src_language=self.src_language
-                    if not isinstance(self.src_language, ListConfig)
-                    else self.src_language[idx],
-                    tgt_language=self.tgt_language
-                    if not isinstance(self.tgt_language, ListConfig)
-                    else self.tgt_language[idx],
+                    src_language=(
+                        self.src_language if not isinstance(self.src_language, ListConfig) else self.src_language[idx]
+                    ),
+                    tgt_language=(
+                        self.tgt_language if not isinstance(self.tgt_language, ListConfig) else self.tgt_language[idx]
+                    ),
                 )
                 datasets.append(dataset)
             dataset = BlendableDataset(
@@ -737,20 +823,9 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
     def list_available_models(self):
         pass
 
-    def on_validation_epoch_end(self):
-        app_state = AppState()
-        if hasattr(self, "_train_ds"):
-            _reconfigure_microbatch_calculator(
-                rank=app_state.global_rank,
-                rampup_batch_size=None,
-                global_batch_size=self._cfg.train_ds.global_batch_size,
-                micro_batch_size=self._cfg.train_ds.micro_batch_size,
-                data_parallel_size=parallel_state.get_data_parallel_world_size(),
-            )
-
     def on_validation_epoch_start(self):
         app_state = AppState()
-        _reconfigure_microbatch_calculator(
+        reconfigure_num_microbatches_calculator(
             rank=app_state.global_rank,
             rampup_batch_size=None,
             global_batch_size=parallel_state.get_data_parallel_world_size(),
@@ -896,11 +971,21 @@ class MegatronNMTModel(MegatronLMEncoderDecoderModel, Exportable):
 
     @property
     def encoder(self):
-        return EncEmb(self.enc_dec_model.encoder_embedding, self.enc_dec_model.enc_dec_model.encoder, self.device)
+        return EncEmb(
+            self.enc_dec_model.encoder_embedding,
+            self.enc_dec_model.enc_dec_model.encoder,
+            self.enc_dec_model.encoder_relative_position_embedding,
+            self.device,
+        )
 
     @property
     def decoder(self):
-        return DecEmb(self.enc_dec_model.decoder_embedding, self.enc_dec_model.enc_dec_model.decoder, self.device)
+        return DecEmb(
+            self.enc_dec_model.decoder_embedding,
+            self.enc_dec_model.enc_dec_model.decoder,
+            self.enc_dec_model.decoder_relative_position_embedding,
+            self.device,
+        )
 
     @property
     def log_softmax(self):

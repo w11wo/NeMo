@@ -15,15 +15,16 @@
 import datetime
 import os
 
+from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks.timer import Timer
+from lightning.pytorch.plugins.environments import TorchElasticEnvironment
+from lightning.pytorch.plugins.precision import MixedPrecisionPlugin
+from lightning.pytorch.trainer.connectors.checkpoint_connector import _CheckpointConnector
 from omegaconf.omegaconf import OmegaConf, open_dict
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks.timer import Timer
-from pytorch_lightning.plugins.environments import TorchElasticEnvironment
-from pytorch_lightning.plugins.precision.native_amp import NativeMixedPrecisionPlugin
-from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
 
 from nemo.collections.nlp.models.language_modeling.megatron_retro_fine_tune_model import MegatronRetroFinetuneModel
 from nemo.collections.nlp.parts.nlp_overrides import (
+    CustomProgressBar,
     GradScaler,
     MegatronHalfPrecisionPlugin,
     NLPDDPStrategy,
@@ -73,44 +74,53 @@ def main(cfg) -> None:
     # import torch.multiprocessing as mp
     # mp.set_start_method("spawn", force=True)
     #####################################################
-    megatron_amp_o2 = cfg.model.get('megatron_amp_O2', False)
+    megatron_amp_O2 = cfg.model.get('megatron_amp_O2', False)
     plugins = []
     strategy = NLPDDPStrategy(
-        no_ddp_communication_hook=True if megatron_amp_o2 else False,
+        no_ddp_communication_hook=True if megatron_amp_O2 else False,
         gradient_as_bucket_view=cfg.model.gradient_as_bucket_view,
         find_unused_parameters=False,
         timeout=datetime.timedelta(seconds=18000),
     )
 
-    if cfg.trainer.precision in [16, 'bf16']:
+    if cfg.trainer.precision in [16, '16', '16-mixed', 'bf16', 'bf16-mixed']:
         scaler = None
-        if cfg.trainer.precision == 16:
+        if cfg.trainer.precision in [16, '16', '16-mixed']:
             scaler = GradScaler(
-                init_scale=cfg.model.get('native_amp_init_scale', 2 ** 32),
+                init_scale=cfg.model.get('native_amp_init_scale', 2**32),
                 growth_interval=cfg.model.get('native_amp_growth_interval', 1000),
                 hysteresis=cfg.model.get('hysteresis', 2),
             )
-        if megatron_amp_o2:
-            plugins.append(MegatronHalfPrecisionPlugin(precision=cfg.trainer.precision, device='cuda', scaler=scaler))
+            # MixedPrecisionPlugin in PTL >= 2.0 requires precision to be 16-mixed or bf16-mixed
+            plugin_precision = '16-mixed'
         else:
-            plugins.append(NativeMixedPrecisionPlugin(precision=cfg.trainer.precision, device='cuda', scaler=scaler))
+            plugin_precision = 'bf16-mixed'
+        if megatron_amp_O2:
+            plugins.append(MegatronHalfPrecisionPlugin(precision=plugin_precision, device='cuda', scaler=scaler))
+        else:
+            plugins.append(MixedPrecisionPlugin(precision=plugin_precision, device='cuda', scaler=scaler))
+        # Set precision None after precision plugins are created as PTL >= 2.1 does not allow both
+        # precision plugins and precision to exist
+        cfg.trainer.precision = None
 
     if cfg.get('cluster_type', None) == 'BCP':
         plugins.append(TorchElasticEnvironment())
 
-    trainer = Trainer(plugins=plugins, strategy=strategy, **cfg.trainer)
+    callbacks = []
+    # enable_progress_bar is True by default. If cfg.trainer.enable_progress_bar=False, CustomProgressBar is not appended to callbacks
+    if 'enable_progress_bar' not in cfg.trainer or cfg.trainer.enable_progress_bar:
+        callbacks.append(CustomProgressBar())
+    trainer = Trainer(plugins=plugins, strategy=strategy, **cfg.trainer, callbacks=callbacks)
     exp_manager(trainer, cfg.exp_manager)
 
-    # update resume from checkpoint found by exp_manager
-    resume_from_checkpoint = trainer._checkpoint_connector.resume_from_checkpoint_fit_path
-    logging.info(f'Resuming training from checkpoint: {resume_from_checkpoint}')
-
-    trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
+    logging.info(f'Resuming training from checkpoint: {trainer.ckpt_path}')
 
     # Override timer callback to a stateless one
     for idx, callback in enumerate(trainer.callbacks):
         if isinstance(callback, Timer):
-            trainer.callbacks[idx] = StatelessTimer(cfg.trainer.max_time,)
+            trainer.callbacks[idx] = StatelessTimer(
+                cfg.trainer.max_time,
+            )
 
     # load existing or init new soft prompt GPT model
     if cfg.model.get("restore_path", None):

@@ -20,11 +20,16 @@ import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 from nemo.collections.asr.data import audio_to_text_dataset
+from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
+from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.ctc import CTCLoss
-from nemo.collections.asr.metrics.wer_bpe import WERBPE, CTCBPEDecoding, CTCBPEDecodingConfig
+from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.ctc_models import EncDecCTCModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
+from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
+from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
+from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
 
@@ -81,7 +86,7 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
         self.decoding = CTCBPEDecoding(self.cfg.decoding, tokenizer=self.tokenizer)
 
         # Setup metric with decoding strategy
-        self._wer = WERBPE(
+        self.wer = WER(
             decoding=self.decoding,
             use_cer=self._cfg.get('use_cer', False),
             dist_sync_on_step=True,
@@ -89,6 +94,15 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
         )
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
+        if config.get("use_lhotse"):
+            return get_lhotse_dataloader_from_config(
+                config,
+                global_rank=self.global_rank,
+                world_size=self.world_size,
+                dataset=LhotseSpeechToTextBpeDataset(tokenizer=self.tokenizer),
+                tokenizer=self.tokenizer,
+            )
+
         dataset = audio_to_text_dataset.get_audio_to_text_bpe_dataset_from_config(
             config=config,
             local_rank=self.local_rank,
@@ -106,17 +120,36 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             return dataset
 
         shuffle = config['shuffle']
-        if config.get('is_tarred', False):
+        if isinstance(dataset, torch.utils.data.IterableDataset):
             shuffle = False
 
         if hasattr(dataset, 'collate_fn'):
             collate_fn = dataset.collate_fn
-        else:
+        elif hasattr(dataset.datasets[0], 'collate_fn'):
+            # support datasets that are lists of entries
             collate_fn = dataset.datasets[0].collate_fn
+        else:
+            # support datasets that are lists of lists
+            collate_fn = dataset.datasets[0].datasets[0].collate_fn
+
+        batch_sampler = None
+        if config.get('use_semi_sorted_batching', False):
+            if not isinstance(dataset, _AudioTextDataset):
+                raise RuntimeError(
+                    "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
+                    f"but found dataset of type {type(dataset)}"
+                )
+            # set batch_size and batch_sampler to None to disable automatic batching
+            batch_sampler = get_semi_sorted_batch_sampler(self, dataset, config)
+            config['batch_size'] = None
+            config['drop_last'] = False
+            shuffle = False
 
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=config['batch_size'],
+            sampler=batch_sampler,
+            batch_sampler=None,
             collate_fn=collate_fn,
             drop_last=config.get('drop_last', False),
             shuffle=shuffle,
@@ -176,12 +209,14 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
         """
         Changes vocabulary of the tokenizer used during CTC decoding process.
         Use this method when fine-tuning on from pre-trained model.
-        This method changes only decoder and leaves encoder and pre-processing modules unchanged. For example, you would
-        use it if you want to use pretrained encoder when fine-tuning on a data in another language, or when you'd need
-        model to learn capitalization, punctuation and/or special characters.
+        This method changes only decoder and leaves encoder and pre-processing modules unchanged.
+        For example, you would use it if you want to use pretrained encoder when fine-tuning on a
+        data in another language, or when you'd need model to learn capitalization, punctuation
+        and/or special characters.
 
         Args:
-            new_tokenizer_dir: Directory path to tokenizer or a config for a new tokenizer (if the tokenizer type is `agg`)
+            new_tokenizer_dir: Directory path to tokenizer or a config for a new tokenizer
+                (if the tokenizer type is `agg`)
             new_tokenizer_type: Either `agg`, `bpe` or `wpe`. `bpe` is used for SentencePiece tokenizers,
                 whereas `wpe` is used for `BertTokenizer`.
             new_tokenizer_cfg: A config for the new tokenizer. if provided, pre-empts the dir and type
@@ -194,7 +229,8 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
                 new_tokenizer_cfg = new_tokenizer_dir
             else:
                 raise ValueError(
-                    f'New tokenizer dir should be a string unless the tokenizer is `agg`, but this tokenizer type is: {new_tokenizer_type}'
+                    f'New tokenizer dir should be a string unless the tokenizer is `agg`, but this tokenizer \
+                        type is: {new_tokenizer_type}'
                 )
         else:
             new_tokenizer_cfg = None
@@ -258,7 +294,7 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
 
         self.decoding = CTCBPEDecoding(decoding_cfg=decoding_cfg, tokenizer=self.tokenizer)
 
-        self._wer = WERBPE(
+        self.wer = WER(
             decoding=self.decoding,
             use_cer=self._cfg.get('use_cer', False),
             log_prediction=self._cfg.get("log_prediction", False),
@@ -274,13 +310,14 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
 
         logging.info(f"Changed tokenizer to {self.decoder.vocabulary} vocabulary.")
 
-    def change_decoding_strategy(self, decoding_cfg: DictConfig):
+    def change_decoding_strategy(self, decoding_cfg: DictConfig, verbose: bool = True):
         """
         Changes decoding strategy used during CTC decoding process.
 
         Args:
             decoding_cfg: A config for the decoder, which is optional. If the decoding type
                 needs to be changed (from say Greedy to Beam decoding etc), the config can be passed here.
+            verbose: Whether to print the new config or not.
         """
         if decoding_cfg is None:
             # Assume same decoding config as before
@@ -292,20 +329,26 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
         decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
         decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
 
-        self.decoding = CTCBPEDecoding(decoding_cfg=decoding_cfg, tokenizer=self.tokenizer,)
+        self.decoding = CTCBPEDecoding(
+            decoding_cfg=decoding_cfg,
+            tokenizer=self.tokenizer,
+        )
 
-        self._wer = WERBPE(
+        self.wer = WER(
             decoding=self.decoding,
-            use_cer=self._wer.use_cer,
-            log_prediction=self._wer.log_prediction,
+            use_cer=self.wer.use_cer,
+            log_prediction=self.wer.log_prediction,
             dist_sync_on_step=True,
         )
+
+        self.decoder.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
         with open_dict(self.cfg.decoding):
             self.cfg.decoding = decoding_cfg
 
-        logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
+        if verbose:
+            logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
 
     @classmethod
     def list_available_models(cls) -> List[PretrainedModelInfo]:
@@ -340,7 +383,7 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
 
         model = PretrainedModelInfo(
             pretrained_model_name="stt_en_citrinet_256_gamma_0_25",
-            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_citrinet_256_gamma_0_25",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:\nemo:stt_en_citrinet_256_gamma_0_25",
             location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_citrinet_256_gamma_0_25/versions/1.0.0/files/stt_en_citrinet_256_gamma_0_25.nemo",
         )
         results.append(model)
@@ -590,6 +633,34 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             pretrained_model_name="stt_eo_conformer_ctc_large",
             description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_eo_conformer_ctc_large",
             location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_eo_conformer_ctc_large/versions/1.14.0/files/stt_eo_conformer_ctc_large.nemo",
+        )
+        results.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_ctc_large",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_ctc_large",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_ctc_large/versions/1.0.0/files/stt_en_fastconformer_ctc_large.nemo",
+        )
+        results.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_ctc_large_ls",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_ctc_large_ls",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_ctc_large_ls/versions/1.0.0/files/stt_en_fastconformer_ctc_large_ls.nemo",
+        )
+        results.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_ctc_xlarge",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_ctc_xlarge",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_ctc_xlarge/versions/1.20.0/files/stt_en_fastconformer_ctc_xlarge.nemo",
+        )
+        results.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_ctc_xxlarge",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_ctc_xxlarge",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_ctc_xxlarge/versions/1.20.1/files/stt_en_fastconformer_ctc_xxlarge.nemo",
         )
         results.append(model)
 

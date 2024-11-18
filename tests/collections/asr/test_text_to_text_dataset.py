@@ -15,13 +15,21 @@
 import json
 import multiprocessing
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 from hydra.utils import instantiate
-from nemo_text_processing.text_normalization.normalize import Normalizer
 from omegaconf import OmegaConf
+
+try:
+    from nemo_text_processing.text_normalization.normalize import Normalizer
+except (ImportError, ModuleNotFoundError):
+    raise ModuleNotFoundError(
+        "The package `nemo_text_processing` was not installed in this environment. Please refer to"
+        " https://github.com/NVIDIA/NeMo-text-processing and install this package before using "
+        "this script"
+    )
 
 from nemo.collections.asr.data.text_to_text import TextToTextDataset, TextToTextItem, TextToTextIterableDataset
 from nemo.collections.common import tokenizers
@@ -96,7 +104,7 @@ def asr_tokenizer(test_data_dir):
 def tts_tokenizer():
     @dataclass
     class G2PConfig:
-        _target_: str = "nemo_text_processing.g2p.modules.EnglishG2p"
+        _target_: str = "nemo.collections.tts.g2p.models.en_us_arpabet.EnglishG2p"
         phoneme_dict: str = str(BASE_DIR / "scripts/tts_dataset_files/cmudict-0.7b_nv22.10")
         heteronyms: str = str(BASE_DIR / "scripts/tts_dataset_files/heteronyms-052722")
         phoneme_probability: float = 0.5
@@ -110,7 +118,7 @@ def tts_tokenizer():
         apostrophe: bool = True
         pad_with_space: bool = True
         add_blank_at: bool = True
-        g2p: G2PConfig = G2PConfig()
+        g2p: G2PConfig = field(default_factory=lambda: G2PConfig())
 
     config = OmegaConf.create(OmegaConf.to_yaml(TextTokenizerCfg()))
     return instantiate(config)

@@ -72,10 +72,10 @@ class T5PromptLearningDataset(BasePromptLearningDataset):
         """
         Loads a dataset by filling in the task templates specified in the config file
         with the information from each training/inference example. Converts all input 
-        text into token ids. Also replaces the <|VIRTUAL_PROMPT_#|> placeholders in 
+        text into token ids. Also replaces the ``<|VIRTUAL_PROMPT_#|>`` placeholders in
         the task templates with the actual virtual prompt token ids. 
 
-        params:
+        Args:
             dataset: A list of json objects or a dictionary objects each
                      containing the information needed for a training example
         """
@@ -152,9 +152,6 @@ class T5PromptLearningDataset(BasePromptLearningDataset):
             if self.min_seq_length <= len(input_ids) <= self.max_seq_length:
                 if self.virtual_prompt_source == VirtualPromptSource.PROMPT_ENCODER:
                     taskname_id = self.tokenizer.text_to_ids(taskname)
-
-                elif self.virtual_prompt_source == VirtualPromptSource.PROMPT_TABLE:
-                    taskname_id = self.task_templates[taskname]["task_id_num"]
                 elif (
                     self.virtual_prompt_source == VirtualPromptSource.NO_PROMPT
                 ):  # TODO (@adithyare) this class and GPTPromptLearningDataset should be merged.

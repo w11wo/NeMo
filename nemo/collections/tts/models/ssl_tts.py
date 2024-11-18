@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
-from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Union
+from typing import Iterable, Optional
 
 import editdistance
 import librosa
 import torch
-import torch.nn as nn
 from hydra.utils import instantiate
+from lightning.pytorch import Trainer
+from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning import Trainer
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.trainer.supporters import CombinedLoader
 
-import nemo.collections.tts.torch.data as TTSData
 from nemo.collections.asr.losses.angularloss import AngularSoftmaxLoss
+from nemo.collections.tts.data.dataset import TTSDataset
+from nemo.collections.tts.modules.ssl_tts import GreedyCTCDecoder
 from nemo.collections.tts.torch.tts_tokenizers import BaseTokenizer, EnglishCharsTokenizer
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
@@ -35,35 +34,14 @@ from nemo.utils import logging
 from nemo.utils.decorators import experimental
 
 
-class GreedyCTCDecoder(torch.nn.Module):
-    def __init__(self, labels, blank=0):
-        super().__init__()
-        self.labels = labels
-        self.blank = blank
-
-    def forward(self, emission):
-        """Given a sequence emission over labels, get the best path
-        Args:
-          emission (Tensor): Logit tensors. Shape `[num_seq, num_label]`.
-
-        Returns:
-          List[str]: The resulting transcript
-        """
-        indices = torch.argmax(emission, dim=-1)  # [num_seq,]
-        indices = torch.unique_consecutive(indices, dim=-1)
-        indices = [i for i in indices if i != self.blank]
-        joined = "".join([self.labels[i] for i in indices])
-        return indices, joined
-
-
 @experimental
 class SSLDisentangler(ModelPT):
     """
     SSLDisentangler is a Conformer based model for extracting disentangled content and speaker embeddings
-    from an audio waveform. This model uses a pre-trained Conformer SSL model. To extract the linguistic content 
-    and speaker representations using a pre-trained Conformer, two randomly initialized downstream 
-    heads are added and the entire setup is finetuned in multi-task manner for speech recognition and speaker verification. 
-    These representations can be used by FastPitchModel_SSL for voice conversion by swapping the speaker embedding 
+    from an audio waveform. This model uses a pre-trained Conformer SSL model. To extract the linguistic content
+    and speaker representations using a pre-trained Conformer, two randomly initialized downstream
+    heads are added and the entire setup is finetuned in multi-task manner for speech recognition and speaker verification.
+    These representations can be used by FastPitchModel_SSL for voice conversion by swapping the speaker embedding
     of a given source utterance, with the speaker embedding of a target speaker.
     """
 
@@ -74,7 +52,7 @@ class SSLDisentangler(ModelPT):
         self._text_tokenizer = EnglishCharsTokenizer(add_blank_at="last")
         self._tb_logger = None
 
-        self.downstream_nets = nn.ModuleDict()
+        self.downstream_nets = torch.nn.ModuleDict()
         for task in self._cfg.downstream_heads.task_names:
 
             if task == 'speaker_verification':
@@ -82,8 +60,8 @@ class SSLDisentangler(ModelPT):
                 in_dim = self._cfg.encoder.d_model
                 out_dim = self._cfg.downstream_heads.speaker_embed_size
                 num_speakers = self._cfg.downstream_heads.num_speakers
-                self.downstream_nets[task] = nn.Linear(in_dim, out_dim)
-                self.sv_linear = nn.Linear(out_dim, num_speakers)
+                self.downstream_nets[task] = torch.nn.Linear(in_dim, out_dim)
+                self.sv_linear = torch.nn.Linear(out_dim, num_speakers)
                 self.sv_loss = AngularSoftmaxLoss(scale=30, margin=0.4)
 
             elif task == 'content':
@@ -91,9 +69,9 @@ class SSLDisentangler(ModelPT):
                 in_dim = self._cfg.encoder.d_model
                 out_dim = self._cfg.downstream_heads.content_embed_size
                 num_chars = len(self._text_tokenizer.tokens)  # list of english tokens
-                self.downstream_nets[task] = nn.Linear(in_dim, out_dim)
-                self.content_linear = nn.Linear(out_dim, num_chars)
-                self.ctc_loss = nn.CTCLoss(blank=self._text_tokenizer.blank, zero_infinity=True)
+                self.downstream_nets[task] = torch.nn.Linear(in_dim, out_dim)
+                self.content_linear = torch.nn.Linear(out_dim, num_chars)
+                self.ctc_loss = torch.nn.CTCLoss(blank=self._text_tokenizer.blank, zero_infinity=True)
                 self.pitch_augment = self._cfg.get('pitch_augment', False)
                 self.augment_ctc = self._cfg.get('augment_ctc', False)
                 self.aug_loss_type = self._cfg.get('aug_loss_type', 'mse')
@@ -101,7 +79,7 @@ class SSLDisentangler(ModelPT):
                 assert (
                     self.stop_gradient and self.augment_ctc
                 ) == False, "stop_gradient and augment_ctc cannot be true at the same time"
-                self.mse_loss = nn.MSELoss()
+                self.mse_loss = torch.nn.MSELoss()
 
                 self.ctc_decoder = GreedyCTCDecoder(self._text_tokenizer.tokens, self._text_tokenizer.blank)
 
@@ -114,7 +92,10 @@ class SSLDisentangler(ModelPT):
         librosa_mel_filter = librosa.filters.mel(
             sr=stft_cfg.sample_rate, n_fft=stft_cfg.n_fft, n_mels=stft_cfg.features, fmin=0, fmax=8000
         )
-        fb = torch.tensor(librosa_mel_filter, dtype=torch.float,).unsqueeze(0)
+        fb = torch.tensor(
+            librosa_mel_filter,
+            dtype=torch.float,
+        ).unsqueeze(0)
 
         self.register_buffer("fb", fb)
 
@@ -171,7 +152,7 @@ class SSLDisentangler(ModelPT):
 
         for task in self._cfg.downstream_heads.task_names:
             if task == 'speaker_verification':
-                sv_dataset = TTSData.TTSDataset(
+                sv_dataset = TTSDataset(
                     manifest_filepath=data_config['manifest_speaker_verification_fp'],
                     sample_rate=self._cfg.sample_rate,
                     text_tokenizer=_text_tokenizer,
@@ -190,7 +171,7 @@ class SSLDisentangler(ModelPT):
                 )
 
             elif task == 'content':
-                content_dataset = TTSData.TTSDataset(
+                content_dataset = TTSDataset(
                     manifest_filepath=data_config['manifest_content_fp'],
                     sample_rate=self._cfg.sample_rate,
                     text_tokenizer=_text_tokenizer,
@@ -234,7 +215,10 @@ class SSLDisentangler(ModelPT):
         sched_downstream_config = optim_downstream_config.pop("sched", None)
         OmegaConf.set_struct(optim_downstream_config, True)
 
-        optim_backbone = instantiate(optim_backbone_config, params=self.encoder.parameters(),)
+        optim_backbone = instantiate(
+            optim_backbone_config,
+            params=self.encoder.parameters(),
+        )
         optim_downstream = instantiate(
             optim_downstream_config,
             params=itertools.chain(
@@ -276,7 +260,8 @@ class SSLDisentangler(ModelPT):
     def forward(self, input_signal=None, input_signal_length=None, normalize_content=True):
 
         processed_signal, processed_signal_length = self.preprocessor_disentangler(
-            input_signal=input_signal, length=input_signal_length,
+            input_signal=input_signal,
+            length=input_signal_length,
         )
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)  # b,c,t
@@ -314,7 +299,9 @@ class SSLDisentangler(ModelPT):
         # Same as forward right now. Earlier version of encoder had a different forward for export.
         # This function is still kept for compatibility with older evaluation/inference scripts.
         return self.forward(
-            input_signal=input_signal, input_signal_length=input_signal_length, normalize_content=normalize_content,
+            input_signal=input_signal,
+            input_signal_length=input_signal_length,
+            normalize_content=normalize_content,
         )
 
     def training_step(self, batch, batch_idx):
@@ -380,7 +367,7 @@ class SSLDisentangler(ModelPT):
                         sim_loss = self.mse_loss(content_embedding, content_embedding_aug)
                     elif self.aug_loss_type == "cosine":
 
-                        cosine_similarity = nn.functional.cosine_similarity(
+                        cosine_similarity = torch.nn.functional.cosine_similarity(
                             content_embedding, content_embedding_aug, dim=-1
                         ).mean()
 
@@ -471,7 +458,7 @@ class SSLDisentangler(ModelPT):
                     if self.aug_loss_type == "mse":
                         sim_loss = self.mse_loss(content_embedding, content_embedding_aug)
                     elif self.aug_loss_type == "cosine":
-                        cosine_similarity = nn.functional.cosine_similarity(
+                        cosine_similarity = torch.nn.functional.cosine_similarity(
                             content_embedding, content_embedding_aug, dim=-1
                         ).mean()
                         sim_loss = 1.0 - cosine_similarity
@@ -502,7 +489,7 @@ class SSLDisentangler(ModelPT):
             'cer': torch.tensor(cers).mean().cpu(),
         }
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self, outputs):
         collect = lambda key: torch.stack([x[key] for x in outputs if torch.isfinite(x[key])]).mean()
         val_loss = collect("val_loss")
         val_sv_loss = collect("sv_loss")

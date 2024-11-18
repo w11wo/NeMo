@@ -15,8 +15,8 @@
 import os
 
 import torch
+from lightning.pytorch import Trainer
 from omegaconf.omegaconf import OmegaConf, open_dict
-from pytorch_lightning import Trainer
 
 from nemo.collections.nlp.models.language_modeling.megatron_retrieval_model import MegatronRetrievalModel
 from nemo.collections.nlp.modules.common.text_generation_server import MegatronServer
@@ -25,11 +25,11 @@ from nemo.collections.nlp.parts.nlp_overrides import NLPDDPStrategy, NLPSaveRest
 from nemo.core.config import hydra_runner
 
 try:
-    from apex.transformer import parallel_state
+    from megatron.core import parallel_state
 
-    HAVE_APEX = True
+    HAVE_MEGATRON_CORE = True
 except (ImportError, ModuleNotFoundError):
-    HAVE_APEX = False
+    HAVE_MEGATRON_CORE = False
 
 """
 This is the script to launch RETRO Model text generation server.
@@ -66,7 +66,10 @@ def main(cfg) -> None:
         save_restore_connector.model_extracted_dir = model_path
 
     model_cfg = MegatronRetrievalModel.restore_from(
-        model_path, trainer=trainer, return_config=True, save_restore_connector=save_restore_connector,
+        model_path,
+        trainer=trainer,
+        return_config=True,
+        save_restore_connector=save_restore_connector,
     )
 
     with open_dict(model_cfg):
@@ -76,11 +79,14 @@ def main(cfg) -> None:
         model_cfg.activations_checkpoint_method = None
 
     model = MegatronRetrievalModel.restore_from(
-        model_path, trainer=trainer, save_restore_connector=save_restore_connector, override_config_path=model_cfg,
+        model_path,
+        trainer=trainer,
+        save_restore_connector=save_restore_connector,
+        override_config_path=model_cfg,
     )
 
     # check whether the DDP is initialized
-    if parallel_state.is_unitialized():
+    if not parallel_state.is_initialized():
 
         def dummy():
             return
