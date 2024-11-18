@@ -18,6 +18,7 @@ import os
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import List, Optional
+import json
 
 import torch
 from omegaconf import OmegaConf
@@ -299,51 +300,88 @@ def main(cfg: AlignmentConfig):
             "model_stride_in_secs": model_stride_in_secs,
             "tokens_per_chunk": tokens_per_chunk,
         }
-    # get start and end line IDs of batches
-    starts, ends = get_batch_starts_ends(cfg.manifest_filepath, cfg.batch_size)
-
-    # init output_timestep_duration = None and we will calculate and update it during the first batch
-    output_timestep_duration = None
-
-    # init f_manifest_out
+    # Setup output directory and target manifest path
     os.makedirs(cfg.output_dir, exist_ok=True)
     tgt_manifest_name = str(Path(cfg.manifest_filepath).stem) + "_with_output_file_paths.json"
     tgt_manifest_filepath = str(Path(cfg.output_dir) / tgt_manifest_name)
-    f_manifest_out = open(tgt_manifest_filepath, 'w')
 
-    # get alignment and save in CTM batch-by-batch
-    for start, end in zip(starts, ends):
-        manifest_lines_batch = get_manifest_lines_batch(cfg.manifest_filepath, start, end)
+    # Track already processed files if target manifest exists
+    processed_files = set()
+    if os.path.exists(tgt_manifest_filepath):
+        logging.info(f"Found existing alignment results at {tgt_manifest_filepath}. Will resume from where it left off.")
+        with open(tgt_manifest_filepath) as f:
+            for line in f:
+                entry = json.loads(line)
+                processed_files.add(entry["audio_filepath"])
+    
+    # Filter out already processed files from manifest
+    unprocessed_lines = []
+    with open(cfg.manifest_filepath) as f:
+        for line in f:
+            entry = json.loads(line)
+            if entry["audio_filepath"] not in processed_files:
+                unprocessed_lines.append(line)
+    
+    if not unprocessed_lines:
+        logging.info("All files have already been processed. Nothing to do.")
+        return None
+    
+    # Create temporary manifest with only unprocessed files
+    temp_manifest = str(Path(cfg.output_dir) / "temp_manifest.json")
+    with open(temp_manifest, "w") as f:
+        for line in unprocessed_lines:
+            f.write(line)
+    
+    # Update manifest path to use temporary one
+    cfg.manifest_filepath = temp_manifest
+    
+    # Open target manifest in append mode if it exists
+    f_manifest_out = open(tgt_manifest_filepath, 'a' if processed_files else 'w')
 
-        (log_probs_batch, y_batch, T_batch, U_batch, utt_obj_batch, output_timestep_duration,) = get_batch_variables(
-            manifest_lines_batch,
-            model,
-            cfg.additional_segment_grouping_separator,
-            cfg.align_using_pred_text,
-            cfg.audio_filepath_parts_in_utt_id,
-            output_timestep_duration,
-            cfg.simulate_cache_aware_streaming,
-            cfg.use_buffered_chunked_streaming,
-            buffered_chunk_params,
-        )
+    try:
+        # get start and end line IDs of batches
+        starts, ends = get_batch_starts_ends(cfg.manifest_filepath, cfg.batch_size)
+        
+        # init output_timestep_duration = None and we will calculate and update it during the first batch
+        output_timestep_duration = None
 
-        alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
-
-        for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
-
-            utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
-
-            if "ctm" in cfg.save_output_file_formats:
-                utt_obj = make_ctm_files(utt_obj, cfg.output_dir, cfg.ctm_file_config,)
-
-            if "ass" in cfg.save_output_file_formats:
-                utt_obj = make_ass_files(utt_obj, cfg.output_dir, cfg.ass_file_config)
-
-            write_manifest_out_line(
-                f_manifest_out, utt_obj,
+        # get alignment and save in CTM batch-by-batch
+        for start, end in zip(starts, ends):
+            manifest_lines_batch = get_manifest_lines_batch(cfg.manifest_filepath, start, end)
+            
+            (log_probs_batch, y_batch, T_batch, U_batch, utt_obj_batch, output_timestep_duration,) = get_batch_variables(
+                manifest_lines_batch,
+                model,
+                cfg.additional_segment_grouping_separator,
+                cfg.align_using_pred_text,
+                cfg.audio_filepath_parts_in_utt_id,
+                output_timestep_duration,
+                cfg.simulate_cache_aware_streaming,
+                cfg.use_buffered_chunked_streaming,
+                buffered_chunk_params,
             )
+            
+            alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
 
-    f_manifest_out.close()
+            for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
+
+                utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
+
+                if "ctm" in cfg.save_output_file_formats:
+                    utt_obj = make_ctm_files(utt_obj, cfg.output_dir, cfg.ctm_file_config,)
+
+                if "ass" in cfg.save_output_file_formats:
+                    utt_obj = make_ass_files(utt_obj, cfg.output_dir, cfg.ass_file_config)
+
+                write_manifest_out_line(
+                    f_manifest_out, utt_obj,
+                )
+
+    finally:
+        f_manifest_out.close()
+        # Clean up temporary manifest
+        if os.path.exists(temp_manifest):
+            os.remove(temp_manifest)
 
     return None
 
