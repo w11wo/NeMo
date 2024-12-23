@@ -328,6 +328,7 @@ def main(cfg: AlignmentConfig):
     
     # Create temporary manifest with only unprocessed files
     temp_manifest = str(Path(cfg.output_dir) / "temp_manifest.json")
+    logging.info(f"Creating temporary manifest: {temp_manifest}")
     with open(temp_manifest, "w") as f:
         for line in unprocessed_lines:
             f.write(line)
